@@ -12,9 +12,9 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/storage"
 	"fyne.io/fyne/v2/widget"
-	"github.com/faiface/beep/mp3"
-	"github.com/faiface/beep/speaker"
 	"github.com/flopp/go-findfont"
+	"github.com/hajimehoshi/oto"
+	"github.com/tosone/minimp3"
 	"image/color"
 	"io"
 	"io/ioutil"
@@ -24,10 +24,11 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
-var interval = 45 * 60
+var interval = 5
 var a fyne.App
 var restTime = interval
 var flag = false
@@ -39,6 +40,8 @@ var ch = make(chan int)
 var audio = make([][]byte, 3)
 var img = ToFile(clockImg)
 var path string
+var context *oto.Context
+var lastIndex = -1
 
 func readConfig(path string) string {
 	file, err := os.Open(path)
@@ -53,7 +56,7 @@ func readConfig(path string) string {
 	defer file.Close()
 	strs := strings.Split(string(buf[:n]), "/")
 	musicName = strs[len(strs)-1]
-	return musicName
+	return string(buf[:n])
 }
 
 func writeConfig(path, content string) {
@@ -67,15 +70,16 @@ func writeConfig(path, content string) {
 }
 
 func main() {
+	rand.Seed(time.Now().Unix())
 	if runtime.GOOS == "linux" {
 		path = "/home/config.cfg"
 	} else if runtime.GOOS == "windows" {
 		path = "C:\\Config\\clockConfig.cfg"
 	}
 	audioName = readConfig(path)
-	audio[0] = ToFile(break1)
-	audio[1] = ToFile(break2)
-	audio[2] = ToFile(break3)
+	audio[0] = ToFile(cai1)
+	audio[1] = ToFile(cai2)
+	audio[2] = ToFile(cai3)
 	DemoClock()
 }
 
@@ -182,18 +186,22 @@ func CreateWindow() {
 			if restTime <= 0 && !music {
 				music = true
 				go func() {
-					select {
-					default:
-						if audioName != "" {
-							playJNTM(audioName)
-						} else {
-							rand.Seed(time.Now().Unix())
-							reader := bytes.NewReader(audio[rand.Intn(len(audio))])
-							playFile(ioutil.NopCloser(reader))
+					if audioName != "" {
+						var mp3File []byte
+						var err error
+						if mp3File, err = ioutil.ReadFile(audioName); err != nil {
+							log.Fatal(err)
 						}
-					case <-out:
-						return
+						play(mp3File)
+					} else {
+						var nowIndex = rand.Intn(len(audio))
+						for lastIndex == nowIndex {
+							nowIndex = rand.Intn(len(audio))
+						}
+						lastIndex = nowIndex
+						play(audio[nowIndex])
 					}
+					music = false
 				}()
 				continue
 			}
@@ -205,7 +213,6 @@ func CreateWindow() {
 			clock.Refresh()
 		}
 	}()
-
 }
 
 func init() {
@@ -224,72 +231,54 @@ func ToTime(rest int) string {
 	return strconv.Itoa(rest/60) + ":" + strconv.Itoa(rest%60)
 }
 
-type MusicEntry struct {
-	Id         string   //编号
-	Name       string   //歌名
-	Artist     string   //作者
-	Source     string   //位置
-	Type       string   //类型
-	Filestream *os.File // 文件流
-}
-
-func (me *MusicEntry) Open() {
-	var err error
-	me.Filestream, err = os.Open(me.Source)
-	if err != nil {
-		log.Fatal(err)
-	}
-}
-
-func (me *MusicEntry) Play() {
-	streamer, format, err := mp3.Decode(me.Filestream)
-	if err != nil {
-		log.Fatal(err)
-
-	}
-	defer streamer.Close()
-	defer speaker.Close()
-	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-	speaker.Play(streamer)
-	select {
-	case <-time.After(time.Second * 9):
-		music = false
-		return
-	case <-out:
-		return
-	}
-}
-
 func Stop() {
 	if music {
 		out <- 1
 	}
 }
 
-func playIO(reader io.ReadCloser) {
-	streamer, format, err := mp3.Decode(reader)
-	if err != nil {
+func play(file []byte) {
+	var err error
+	var dec *minimp3.Decoder
+	if dec, err = minimp3.NewDecoder(bytes.NewReader(file)); err != nil {
 		log.Fatal(err)
 	}
-	defer streamer.Close()
-	defer speaker.Close()
-	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-	speaker.Play(streamer)
-	select {
-	case <-time.After(time.Second * 9):
-		music = false
-		return
-	case <-out:
-		return
+	started := dec.Started()
+	<-started
+
+	if context == nil {
+		if context, err = oto.NewContext(dec.SampleRate, dec.Channels, 2, 1024*10); err != nil {
+			log.Fatal(err)
+		}
+
 	}
-}
+	var player = context.NewPlayer()
 
-func playJNTM(filename string) {
-	player := MusicEntry{Source: filename}
-	player.Open()
-	player.Play()
-}
+	var waitForPlayOver = new(sync.WaitGroup)
+	waitForPlayOver.Add(1)
 
-func playFile(reader io.ReadCloser) {
-	playIO(reader)
+	go func() {
+		for {
+			var data = make([]byte, 1024*10)
+			_, err := dec.Read(data)
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				break
+			}
+			player.Write(data)
+			select {
+			case <-out:
+				waitForPlayOver.Done()
+				runtime.Goexit()
+			default:
+			}
+		}
+		waitForPlayOver.Done()
+	}()
+	waitForPlayOver.Wait()
+	<-time.After(time.Second)
+	dec.Close()
+	player.Close()
 }
