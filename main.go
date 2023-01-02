@@ -28,7 +28,7 @@ import (
 	"time"
 )
 
-var interval = 5
+var interval = 45 * 60
 var a fyne.App
 var restTime = interval
 var flag = false
